@@ -11,7 +11,15 @@ Nothing is written to disk: audio and transcript live in RAM only and the
 transcript window is pruned to the last TRANSCRIPT_WINDOW_SEC seconds.
 
 Run:    python lecture_helper.py
-Check:  python lecture_helper.py --check    (tests audio device, whisper, ollama, then exits)
+Check:  python lecture_helper.py --check    (lists output devices, tests whisper + ollama, then exits)
+Flags:  --device NAME   start listening to the output device whose name contains NAME
+        --visible       do not hide the window from screen capture
+
+Which audio is heard: WASAPI loopback captures one OUTPUT DEVICE, not one app.
+Pick the device in the "Listen to" dropdown. To hear only Zoom/Teams, give that app
+its own output device in Windows: Settings > System > Sound > Volume mixer > (app) >
+Output device, then select that device here. A second headset, monitor speakers or a
+virtual cable (VB-Cable) all work as that separate device.
 """
 
 import collections
@@ -104,8 +112,17 @@ def load_whisper(status):
 
 
 # ------------------------------------------------------------------- audio ---
-def find_loopback(pa):
+def list_loopback_devices(pa):
+    """All WASAPI output devices that can be captured, as (index, display name)."""
+    return [(d["index"], d["name"].replace(" [Loopback]", ""))
+            for d in pa.get_loopback_device_info_generator()]
+
+
+def find_loopback(pa, device_index=None):
+    """Loopback device by index, or the one matching the Windows default output."""
     import pyaudiowpatch as pyaudio
+    if device_index is not None:
+        return pa.get_device_info_by_index(device_index)
     wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
     spk = pa.get_device_info_by_index(wasapi["defaultOutputDevice"])
     if spk.get("isLoopbackDevice"):
@@ -114,6 +131,17 @@ def find_loopback(pa):
         if spk["name"] in lb["name"]:
             return lb
     raise RuntimeError("No WASAPI loopback device for default speakers: " + spk["name"])
+
+
+def pick_device_from_args(devices):
+    """--device NAME  -> index of the first loopback device whose name contains NAME."""
+    if "--device" in sys.argv:
+        want = sys.argv[sys.argv.index("--device") + 1].lower()
+        for idx, name in devices:
+            if want in name.lower():
+                return idx
+        log(f"--device '{want}' not found; using default output")
+    return None
 
 
 def resample(x, sr, target=TARGET_SR):
@@ -171,10 +199,11 @@ class Segmenter:
 
 
 class AudioCapture(threading.Thread):
-    def __init__(self, utter_q, status):
+    def __init__(self, utter_q, status, device_index=None):
         super().__init__(daemon=True)
         self.utter_q = utter_q
         self.status = status
+        self.device_index = device_index
         self.stop_flag = threading.Event()
         self.device_name = "?"
 
@@ -182,7 +211,7 @@ class AudioCapture(threading.Thread):
         import pyaudiowpatch as pyaudio
         pa = pyaudio.PyAudio()
         try:
-            dev = find_loopback(pa)
+            dev = find_loopback(pa, self.device_index)
             self.device_name = dev["name"]
             sr = int(dev["defaultSampleRate"])
             ch = max(1, int(dev["maxInputChannels"]))
@@ -343,8 +372,40 @@ class App:
         self.last_answer_ts = 0.0
         self.auto = tk.BooleanVar(value=AUTO_ANSWER)
 
+        # ---- device picker: which output device to listen to ----
+        import pyaudiowpatch as pyaudio
+        from tkinter import ttk
+        pa = pyaudio.PyAudio()
+        self.devices = list_loopback_devices(pa)              # [(index, name), ...]
+        try:
+            default_idx = find_loopback(pa)["index"]
+        except Exception:
+            default_idx = self.devices[0][0] if self.devices else None
+        pa.terminate()
+        self.device_index = pick_device_from_args(self.devices)
+        if self.device_index is None:
+            self.device_index = default_idx
+
+        devrow = tk.Frame(self.root, bg=self.BG)
+        devrow.pack(fill="x", padx=10, pady=(8, 0))
+        tk.Label(devrow, text="Listen to", fg=self.DIM, bg=self.BG, font=("Segoe UI", 9)).pack(side="left")
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+        style.configure("Dark.TCombobox", fieldbackground="#1c2026", background="#2a2e35",
+                        foreground=self.FG, arrowcolor=self.FG, selectbackground="#1c2026",
+                        selectforeground=self.FG)
+        self.device_var = tk.StringVar()
+        self.device_box = ttk.Combobox(devrow, textvariable=self.device_var, state="readonly",
+                                       style="Dark.TCombobox", font=("Segoe UI", 9),
+                                       values=[n for _, n in self.devices])
+        for idx, name in self.devices:
+            if idx == self.device_index:
+                self.device_var.set(name)
+        self.device_box.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.device_box.bind("<<ComboboxSelected>>", self._on_device_change)
+
         top = tk.Frame(self.root, bg=self.BG)
-        top.pack(fill="x", padx=10, pady=(8, 0))
+        top.pack(fill="x", padx=10, pady=(6, 0))
         tk.Label(top, text="Heard", fg=self.DIM, bg=self.BG, font=("Segoe UI", 9)).pack(anchor="w")
         self.heard = tk.Label(top, text="...", fg=self.FG, bg=self.BG, font=("Segoe UI", 10),
                               justify="left", anchor="w", wraplength=450)
@@ -377,7 +438,7 @@ class App:
             self.root.after(300, self._hide_from_capture)
 
         notes = load_notes()
-        self.capture = AudioCapture(self.utter_q, self.set_status)
+        self.capture = AudioCapture(self.utter_q, self.set_status, self.device_index)
         self.transcriber = Transcriber(self.utter_q, self.on_text, self.set_status, prompt_hint=notes)
         self.capture.start()
         self.transcriber.start()
@@ -431,6 +492,18 @@ class App:
             self.busy = False
 
     # ---- main thread ----
+    def _on_device_change(self, _event=None):
+        name = self.device_var.get()
+        idx = next((i for i, n in self.devices if n == name), None)
+        if idx is None or idx == self.device_index:
+            return
+        self.device_index = idx
+        self.capture.stop_flag.set()
+        self.capture.join(timeout=2)
+        self.capture = AudioCapture(self.utter_q, self.set_status, idx)
+        self.capture.start()
+        self.root.focus()  # drop focus from the combobox so Enter still means "Answer now"
+
     def _pump(self):
         try:
             while True:
@@ -482,8 +555,11 @@ def self_check():
     try:
         import pyaudiowpatch as pyaudio
         pa = pyaudio.PyAudio()
-        dev = find_loopback(pa)
-        print("loopback device:", dev["name"], "| rate", int(dev["defaultSampleRate"]), "| ch", dev["maxInputChannels"])
+        devices = list_loopback_devices(pa)
+        for idx, name in devices:
+            print(f"  [{idx}] {name}")
+        dev = find_loopback(pa, pick_device_from_args(devices))
+        print("selected:", dev["name"], "| rate", int(dev["defaultSampleRate"]), "| ch", dev["maxInputChannels"])
         pa.terminate()
     except Exception as e:
         ok = False
