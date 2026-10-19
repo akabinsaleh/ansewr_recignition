@@ -1,0 +1,7 @@
+# Put your course notes here. Plain text. The model reads this file every time it answers,
+# so you can edit it during class. Keep it under ~12000 characters (longer is truncated).
+#
+# Example:
+# Course: Operating Systems
+# Process = program in execution. Thread = lightweight process sharing memory.
+# Deadlock needs 4 conditions: mutual exclusion, hold and wait, no preemption, circular wait.
