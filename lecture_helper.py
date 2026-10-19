@@ -11,15 +11,17 @@ Nothing is written to disk: audio and transcript live in RAM only and the
 transcript window is pruned to the last TRANSCRIPT_WINDOW_SEC seconds.
 
 Run:    python lecture_helper.py
-Check:  python lecture_helper.py --check    (lists output devices, tests whisper + ollama, then exits)
-Flags:  --device NAME   start listening to the output device whose name contains NAME
+Check:  python lecture_helper.py --check    (lists apps + devices, tests whisper + ollama, then exits)
+Flags:  --app NAME      listen to one application only, e.g. --app zoom   (needs applloopback.exe)
+        --device NAME   listen to a whole output device whose name contains NAME
         --visible       do not hide the window from screen capture
 
-Which audio is heard: WASAPI loopback captures one OUTPUT DEVICE, not one app.
-Pick the device in the "Listen to" dropdown. To hear only Zoom/Teams, give that app
-its own output device in Windows: Settings > System > Sound > Volume mixer > (app) >
-Output device, then select that device here. A second headset, monitor speakers or a
-virtual cable (VB-Cable) all work as that separate device.
+"Listen to" dropdown has two kinds of sources:
+  App: zoom.exe        only that program (and its child processes), like OBS "Application Audio
+                       Capture". Uses applloopback.exe (Windows 10 2004+ process-loopback API).
+  Device: Headphones   everything playing on that output device (classic WASAPI loopback).
+The app list = programs with an open audio session (same as the Windows volume mixer) plus
+running meeting/browser apps. Press the refresh button after joining a call.
 """
 
 import collections
@@ -28,6 +30,7 @@ import json
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -42,6 +45,10 @@ WHISPER_MODEL = "small.en"         # "base.en" = faster, "small.en" = better wit
 OLLAMA_URL = "http://localhost:11434"
 OLLAMA_MODEL = "qwen3.5:4b"
 NOTES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes.txt")
+APP_LOOPBACK_EXE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "applloopback.exe")
+# shown in the app list even when they are silent right now (must be running)
+KNOWN_APPS = ("zoom.exe", "teams.exe", "ms-teams.exe", "chrome.exe", "msedge.exe", "firefox.exe",
+              "brave.exe", "opera.exe", "discord.exe", "webex.exe", "slack.exe", "skype.exe")
 MAX_NOTES_CHARS = 12000            # keep prompt inside num_ctx
 TRANSCRIPT_WINDOW_SEC = 60
 AUTO_ANSWER = True                 # answer automatically on questions / your name
@@ -131,6 +138,57 @@ def find_loopback(pa, device_index=None):
         if spk["name"] in lb["name"]:
             return lb
     raise RuntimeError("No WASAPI loopback device for default speakers: " + spk["name"])
+
+
+def _root_of_tree(proc):
+    """Walk up while the parent has the same exe name (chrome.exe spawns chrome.exe children)."""
+    import psutil
+    try:
+        while True:
+            parent = proc.parent()
+            if parent is None or parent.name().lower() != proc.name().lower():
+                return proc
+            proc = parent
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return proc
+
+
+def list_audio_apps():
+    """Programs that can be captured individually: (root_pid, exe name).
+    Apps with an audio session (like the Windows volume mixer) + running KNOWN_APPS."""
+    import psutil
+    found = {}
+    try:
+        from pycaw.pycaw import AudioUtilities
+        for s in AudioUtilities.GetAllSessions():
+            if s.Process and s.Process.pid != os.getpid():
+                root = _root_of_tree(s.Process)
+                found[root.pid] = root.name()
+    except Exception as e:
+        log("audio session list failed:", repr(e))
+    for p in psutil.process_iter(["pid", "name"]):
+        name = (p.info["name"] or "").lower()
+        if name in KNOWN_APPS:
+            root = _root_of_tree(p)
+            found.setdefault(root.pid, root.name())
+    me = os.path.basename(sys.executable).lower()
+    return sorted(((pid, n) for pid, n in found.items() if n.lower() != me or pid != os.getpid()),
+                  key=lambda t: t[1].lower())
+
+
+def app_capture_available():
+    return os.path.exists(APP_LOOPBACK_EXE)
+
+
+def pick_app_from_args(apps):
+    """--app NAME -> pid of the first app whose exe name contains NAME."""
+    if "--app" in sys.argv:
+        want = sys.argv[sys.argv.index("--app") + 1].lower()
+        for pid, name in apps:
+            if want in name.lower():
+                return pid
+        log(f"--app '{want}' not running; using default output")
+    return None
 
 
 def pick_device_from_args(devices):
@@ -233,6 +291,50 @@ class AudioCapture(threading.Thread):
             self.status(f"Audio error: {e}")
         finally:
             pa.terminate()
+
+
+class AppCapture(threading.Thread):
+    """Capture ONE program's audio through applloopback.exe (process loopback)."""
+
+    def __init__(self, utter_q, status, pid, app_name=""):
+        super().__init__(daemon=True)
+        self.utter_q = utter_q
+        self.status = status
+        self.pid = pid
+        self.app_name = app_name
+        self.stop_flag = threading.Event()
+        self.device_name = f"app {app_name} (pid {pid})"
+        self.proc = None
+
+    def run(self):
+        try:
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            self.proc = subprocess.Popen([APP_LOOPBACK_EXE, str(self.pid)], stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, creationflags=flags)
+            header = self.proc.stdout.readline().decode(errors="ignore").split()
+            if len(header) != 4 or header[0] != "FORMAT":
+                err = self.proc.stderr.read().decode(errors="ignore").strip()
+                raise RuntimeError(err or "applloopback.exe gave no FORMAT header")
+            sr, ch = int(header[1]), int(header[2])
+            frame_bytes = int(sr * FRAME_SEC) * ch * 2
+            seg = Segmenter(self.utter_q.put)
+            self.status(f"Listening: {self.app_name} only")
+            while not self.stop_flag.is_set():
+                data = self.proc.stdout.read(frame_bytes)
+                if len(data) < frame_bytes:
+                    break
+                x = np.frombuffer(data, np.int16).astype(np.float32) / 32768.0
+                if ch > 1:
+                    x = x.reshape(-1, ch).mean(axis=1)
+                seg.feed(resample(x, sr))
+            if not self.stop_flag.is_set():
+                self.status(f"{self.app_name} capture ended (app closed?)")
+        except Exception as e:
+            log("App capture error:", repr(e))
+            self.status(f"App capture error: {e}")
+        finally:
+            if self.proc and self.proc.poll() is None:
+                self.proc.kill()
 
 
 # ------------------------------------------------------------ transcriber ---
@@ -372,19 +474,11 @@ class App:
         self.last_answer_ts = 0.0
         self.auto = tk.BooleanVar(value=AUTO_ANSWER)
 
-        # ---- device picker: which output device to listen to ----
-        import pyaudiowpatch as pyaudio
+        # ---- source picker: one app, or a whole output device ----
         from tkinter import ttk
-        pa = pyaudio.PyAudio()
-        self.devices = list_loopback_devices(pa)              # [(index, name), ...]
-        try:
-            default_idx = find_loopback(pa)["index"]
-        except Exception:
-            default_idx = self.devices[0][0] if self.devices else None
-        pa.terminate()
-        self.device_index = pick_device_from_args(self.devices)
-        if self.device_index is None:
-            self.device_index = default_idx
+        self.sources = []          # [("app", pid, label) | ("device", index, label)]
+        self.source = None         # currently captured source tuple
+        self._build_sources()
 
         devrow = tk.Frame(self.root, bg=self.BG)
         devrow.pack(fill="x", padx=10, pady=(8, 0))
@@ -394,15 +488,14 @@ class App:
         style.configure("Dark.TCombobox", fieldbackground="#1c2026", background="#2a2e35",
                         foreground=self.FG, arrowcolor=self.FG, selectbackground="#1c2026",
                         selectforeground=self.FG)
-        self.device_var = tk.StringVar()
+        self.device_var = tk.StringVar(value=self.source[2] if self.source else "")
         self.device_box = ttk.Combobox(devrow, textvariable=self.device_var, state="readonly",
                                        style="Dark.TCombobox", font=("Segoe UI", 9),
-                                       values=[n for _, n in self.devices])
-        for idx, name in self.devices:
-            if idx == self.device_index:
-                self.device_var.set(name)
+                                       values=[s[2] for s in self.sources])
         self.device_box.pack(side="left", fill="x", expand=True, padx=(6, 0))
-        self.device_box.bind("<<ComboboxSelected>>", self._on_device_change)
+        self.device_box.bind("<<ComboboxSelected>>", self._on_source_change)
+        tk.Button(devrow, text="↻", command=self._refresh_sources, bg="#2a2e35", fg=self.FG,
+                  relief="flat", padx=6, font=("Segoe UI", 9)).pack(side="left", padx=(4, 0))
 
         top = tk.Frame(self.root, bg=self.BG)
         top.pack(fill="x", padx=10, pady=(6, 0))
@@ -438,9 +531,9 @@ class App:
             self.root.after(300, self._hide_from_capture)
 
         notes = load_notes()
-        self.capture = AudioCapture(self.utter_q, self.set_status, self.device_index)
+        self.capture = None
+        self._start_capture(self.source)
         self.transcriber = Transcriber(self.utter_q, self.on_text, self.set_status, prompt_hint=notes)
-        self.capture.start()
         self.transcriber.start()
         threading.Thread(target=ollama_warmup, daemon=True).start()
         self.root.after(100, self._pump)
@@ -491,18 +584,62 @@ class App:
         finally:
             self.busy = False
 
-    # ---- main thread ----
-    def _on_device_change(self, _event=None):
-        name = self.device_var.get()
-        idx = next((i for i, n in self.devices if n == name), None)
-        if idx is None or idx == self.device_index:
+    # ---- sources (main thread) ----
+    def _build_sources(self):
+        """Fill self.sources; pick self.source from --app / --device / default output."""
+        import pyaudiowpatch as pyaudio
+        apps = list_audio_apps() if app_capture_available() else []
+        pa = pyaudio.PyAudio()
+        devices = list_loopback_devices(pa)
+        try:
+            default_idx = find_loopback(pa)["index"]
+        except Exception:
+            default_idx = devices[0][0] if devices else None
+        pa.terminate()
+
+        self.sources = [("app", pid, f"App: {name}  (pid {pid})") for pid, name in apps]
+        self.sources += [("device", idx, f"Device: {name}") for idx, name in devices]
+
+        if self.source is None:                     # first time: honour command line flags
+            want = pick_app_from_args(apps)
+            kind, ident = ("app", want) if want is not None else ("device", pick_device_from_args(devices))
+            if ident is None:
+                kind, ident = "device", default_idx
+            self.source = next((s for s in self.sources if s[0] == kind and s[1] == ident), None)
+        elif self.source not in self.sources:       # refresh: keep current source if still valid
+            self.source = next((s for s in self.sources if s[0] == self.source[0] and s[1] == self.source[1]),
+                               self.source)
+
+    def _start_capture(self, source):
+        if self.capture is not None:
+            self.capture.stop_flag.set()
+            self.capture.join(timeout=2)
+        self.source = source
+        if source is None:
+            self.set_status("No audio source found")
             return
-        self.device_index = idx
-        self.capture.stop_flag.set()
-        self.capture.join(timeout=2)
-        self.capture = AudioCapture(self.utter_q, self.set_status, idx)
+        kind, ident, label = source
+        if kind == "app":
+            self.capture = AppCapture(self.utter_q, self.set_status, ident, label.split("  (pid")[0][5:])
+        else:
+            self.capture = AudioCapture(self.utter_q, self.set_status, ident)
         self.capture.start()
+
+    def _on_source_change(self, _event=None):
+        label = self.device_var.get()
+        src = next((s for s in self.sources if s[2] == label), None)
+        if src is not None and src != self.source:
+            self._start_capture(src)
         self.root.focus()  # drop focus from the combobox so Enter still means "Answer now"
+
+    def _refresh_sources(self):
+        self._build_sources()
+        self.device_box.config(values=[s[2] for s in self.sources])
+        if self.source is not None:
+            self.device_var.set(self.source[2])
+        self.root.focus()
+
+    # ---- main thread ----
 
     def _pump(self):
         try:
@@ -540,7 +677,8 @@ class App:
         self.answer.config(text="Waiting for a question...")
 
     def quit(self):
-        self.capture.stop_flag.set()
+        if self.capture is not None:
+            self.capture.stop_flag.set()
         self.utter_q.put(None)
         self.root.destroy()
 
@@ -559,11 +697,39 @@ def self_check():
         for idx, name in devices:
             print(f"  [{idx}] {name}")
         dev = find_loopback(pa, pick_device_from_args(devices))
-        print("selected:", dev["name"], "| rate", int(dev["defaultSampleRate"]), "| ch", dev["maxInputChannels"])
+        print("default device:", dev["name"], "| rate", int(dev["defaultSampleRate"]), "| ch", dev["maxInputChannels"])
         pa.terminate()
     except Exception as e:
         ok = False
         print("FAIL:", repr(e))
+
+    print("== per-app capture ==")
+    if not app_capture_available():
+        print("applloopback.exe missing: only whole-device capture. Run build.bat to create it.")
+    else:
+        try:
+            apps = list_audio_apps()
+            for pid, name in apps:
+                print(f"  [{pid}] {name}")
+            if not apps:
+                print("  (no capturable apps running)")
+            target = pick_app_from_args(apps) or os.getpid()
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            p = subprocess.Popen([APP_LOOPBACK_EXE, str(target)], stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, creationflags=flags)
+            header = p.stdout.readline().decode(errors="ignore").strip()
+            data = p.stdout.read(16000 * 2)      # ~1 s
+            p.kill()
+            err = p.stderr.read().decode(errors="ignore").strip()
+            if header.startswith("FORMAT") and len(data) > 0:
+                x = np.frombuffer(data, np.int16).astype(np.float32) / 32768
+                print(f"helper OK: {header} | pid {target} rms {np.sqrt(np.mean(x * x)):.4f}")
+            else:
+                ok = False
+                print("FAIL: helper gave no audio.", err)
+        except Exception as e:
+            ok = False
+            print("FAIL:", repr(e))
 
     print("== whisper ==")
     try:
